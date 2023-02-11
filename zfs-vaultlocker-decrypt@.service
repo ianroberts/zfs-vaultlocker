@@ -1,0 +1,17 @@
+[Unit]
+Description=Retrieve ZFS encryption key from vault for %I
+DefaultDependencies=no
+After=network-online.target
+After=nss-lookup.target
+After=zfs.target
+Wants=zfs.target
+
+[Service]
+Type=oneshot
+KillMode=none
+ExecStart=/usr/local/sbin/zfs-vaultlocker decrypt %I
+ExecStartPost=-/sbin/zfs mount -a
+TimeoutSec=0
+
+[Install]
+WantedBy=multi-user.target

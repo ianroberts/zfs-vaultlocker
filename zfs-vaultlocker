@@ -1,0 +1,346 @@
+#!/usr/bin/python3
+
+import argparse
+import configparser
+import hvac
+import logging
+import os
+import pexpect
+import secrets
+import socket
+import subprocess
+import sys
+import tempfile
+import tenacity
+
+logger = logging.getLogger(__name__)
+CONF_FILE = '/etc/vaultlocker/vaultlocker.conf'
+
+
+
+def _vault_client(config):
+    """Helper wrapper to create Vault Client
+
+    :param: config: configparser object of vaultlocker config
+    :returns: hvac.Client. configured Vault Client object
+    """
+    client = hvac.Client(url=config.get('vault', 'url'))
+    client.auth_approle(config.get('vault', 'approle'),
+                        secret_id=config.get('vault', 'secret_id'))
+    return client
+
+
+def _get_vault_path(dataset, config):
+    """Generate full vault path for a given dataset name
+
+    :param: dataset: string of the dataset name
+    :param: config: configparser object of vaultlocker config
+    :returns: str: Path to vault resource for device
+    """
+    return '{}/{}/{}'.format(config.get('vault', 'backend'),
+                             socket.gethostname(),
+                             dataset)
+
+
+def _escape_dataset(dataset):
+    """Escape a dataset name using systemd-escape
+
+    :param: dataset: dataset name to escape
+    :returns: str: escaped form of the name
+    """
+    return subprocess.check_output(['systemd-escape', dataset],
+                                   encoding='utf-8').strip()
+
+
+def _enable_decrypt_unit(dataset):
+    """Enable the systemd unit that will decrypt the given dataset at boot.
+
+    :param: dataset: dataset name for which to enable the decrypt unit
+    """
+    logger.info(f'Configuring {dataset} to be unlocked at boot')
+    escaped_dataset = _escape_dataset(dataset)
+
+    subprocess.check_output([
+        '/bin/systemctl',
+        'enable',
+        f'zfs-vaultlocker-decrypt@{escaped_dataset}.service'
+    ])
+
+
+def _generate_key(dataset, client, config):
+    """Generate a random hex key for the given dataset, store it in Vault and
+    return it.
+
+    :param: dataset: string of the dataset name
+    :param: client: hvac.Client for Vault access
+    :param: config: configparser object of vaultlocker config
+    """
+    logger.info(f'Generating random key for {dataset}')
+    # Generate random key
+    key = secrets.token_hex(32)
+
+    # Write to Vault
+    vault_path = _get_vault_path(dataset, config)
+    client.write(vault_path, key=key)
+
+    # Verify it was written correctly
+    stored_data = client.read(vault_path)
+    assert key == stored_data['data']['key']
+
+    return key
+
+
+def _create_dataset(args, client, config):
+    """Create a new ZFS dataset encrypted with a random key, store the key
+    in Vault and configure the dataset to be unlocked at boot time.
+
+    :param: args: argparser generated cli arguments
+    :param: client: hvac.Client for Vault access
+    :param: config: configparser object of vaultlocker config
+    """
+    key = _generate_key(args.dataset, client, config)
+
+    command_args = [
+        'create',
+        '-o',
+        'encryption=aes-256-gcm',
+        '-o',
+        'keylocation=prompt',
+        '-o',
+        'keyformat=hex',
+    ]
+    if args.create_args:
+        command_args.extend(args.create_args)
+
+    command_args.append(dataset)
+
+    logger.info(f'Creating dataset {dataset}')
+
+    create_cmd = pexpect.spawn('/sbin/zfs', command_args)
+    create_cmd.expect('Enter hex key: ')
+    create_cmd.sendline(key)
+    create_cmd.expect('Re-enter hex key: ')
+    create_cmd.sendline(key)
+    create_cmd.expect(pexpect.EOF)
+
+    _enable_decrypt_unit(dataset)
+
+
+def _generate_and_save_key(args, client, config):
+    """Generate a random hex key for the given dataset, store it in Vault and
+    save it to a temporary file.
+
+    :param: args: argparser generated cli arguments
+    :param: client: hvac.Client for Vault access
+    :param: config: configparser object of vaultlocker config
+    """
+    key = _generate_key(args.dataset, client, config)
+
+    escaped_dataset = _escape_dataset(dataset)
+
+    fd, path = tempfile.mkstemp(dir=args.directory,
+                                prefix=f'zfs-vaultlocker-{escaped_dataset}-',
+                                suffix='.key',
+                                text=True)
+
+    with os.fdopen(fd, 'w') as f:
+        f.write(key)
+
+    logger.info(f'Generated key for {dataset} written to {path}')
+
+
+def _decrypt_at_boot(args, client, config):
+    """Configure a dataset to be decrypted at boot.
+
+    :param: args: argparser generated cli arguments
+    :param: client: hvac.Client for Vault access
+    :param: config: configparser object of vaultlocker config
+    """
+    dataset = args.dataset
+    vault_path = _get_vault_path(dataset, config)
+    try:
+        stored_data = client.read(vault_path)
+        if not stored_data['data']['key']:
+            raise hvac.exceptions.VaultError()
+    except hvac.exceptions.VaultError:
+        logger.error('Key not available in Vault for {dataset}')
+        return
+
+    # Sanity check complete
+    _enable_decrypt_unit(dataset)
+
+
+def _decrypt_dataset(args, client, config):
+    """Load the key for a given dataset from Vault.
+
+    :param: args: argparser generated cli arguments
+    :param: client: hvac.Client for Vault access
+    :param: config: configparser object of vaultlocker config
+    """
+    dataset = args.dataset
+
+    vault_path = _get_vault_path(dataset, config)
+    stored_data = client.read(vault_path)
+    if stored_data is None:
+        raise ValueError('Unable to locate key for {}'.format(dataset))
+    key = stored_data['data']['key']
+
+    command = [
+        '/sbin/zfs',
+        'load-key',
+        dataset,
+    ]
+    subprocess.check_output(command, input=key.encode('UTF-8'))
+
+
+def _do_it_with_persistence(func, args, config):
+    """Exec func with retries based on provided cli flags
+
+    :param: func: function to attempt to execute
+    :param: args: argparser generated cli arguments
+    :param: config: configparser object of vaultlocker config
+    """
+    @tenacity.retry(
+        wait=tenacity.wait_fixed(1),
+        reraise=True,
+        stop=(
+            tenacity.stop_after_delay(args.retry) if args.retry > 0
+            else tenacity.stop_after_attempt(1)
+            ),
+        retry=(
+            tenacity.retry_if_exception(hvac.exceptions.VaultNotInitialized) |
+            tenacity.retry_if_exception(hvac.exceptions.VaultDown)
+            )
+        )
+    def _do_it():
+        client = _vault_client(config)
+        func(args, client, config)
+    _do_it()
+
+
+def create(args, config):
+    """Generate random key, store it in Vault and create a dataset encrypted
+    with that key.
+
+    :param: args: argparser generated cli arguments
+    :param: config: configparser object of vaultlocker config
+    """
+    _do_it_with_persistence(_create_dataset, args, config)
+
+
+def decrypt(args, config):
+    """Decrypt and open handler
+
+    :param: args: argparser generated cli arguments
+    :param: config: configparser object of vaultlocker config
+    """
+    _do_it_with_persistence(_decrypt_dataset, args, config)
+
+
+def generate_key(args, config):
+    """Generate random key, store it in Vault and dump to a file.
+
+    :param: args: argparser generated cli arguments
+    :param: config: configparser object of vaultlocker config
+    """
+    _do_it_with_persistence(_generate_and_save_key, args, config)
+
+
+def enable_unit(args, config):
+    """Enable the systemd unit that will load the key at boot for a dataset.
+
+    :param: args: argparser generated cli arguments
+    :param: config: configparser object of vaultlocker config
+    """
+    _do_it_with_persistence(_decrypt_at_boot, args, config)
+
+
+def get_config():
+    """Read vaultlocker configuration from config file
+
+    :returns: configparser. Parsed configuration options
+    """
+    config = configparser.ConfigParser()
+    if os.path.exists(CONF_FILE):
+        config.read(CONF_FILE)
+    return config
+
+
+def main():
+    parser = argparse.ArgumentParser('zfs-vaultlocker')
+    parser.set_defaults(prog=parser.prog)
+    subparsers = parser.add_subparsers(
+        title="subcommands",
+        description="valid subcommands",
+        required=True,
+        help="sub-command help",
+    )
+    parser.add_argument(
+        '--retry',
+        default=-1,
+        type=int,
+        help="Time in seconds to continue retrying to connect to Vault"
+    )
+
+    create_parser = subparsers.add_parser(
+        'create',
+        help='Create a ZFS dataset encrypted with a random key stored in Vault'
+    )
+    create_parser.add_argument('dataset',
+                               metavar='zpool/dataset',
+                               help="ZFS dataset to create, including its containing pool")
+    create_parser.add_argument('create_args',
+                               metavar='-o ...', nargs=argparse.REMAINDER,
+                               help="Additional arguments passed through to zfs create")
+    create_parser.set_defaults(func=create)
+
+    decrypt_parser = subparsers.add_parser(
+        'decrypt',
+        help='Retrieve the key for a dataset from Vault and load it into ZFS'
+    )
+    decrypt_parser.add_argument('dataset',
+                                metavar='zpool/dataset',
+                                help='Dataset for which to load the key')
+    decrypt_parser.set_defaults(func=decrypt)
+
+    generate_key_parser = subparsers.add_parser(
+        'generate-key',
+        help='Generate and store a random key, as in "create", but do not create the actual '
+            + 'dataset.  Instead write the key to a temporary file so it can be used to '
+            + 'create the dataset via "zfs receive"'
+    )
+    generate_key_parser.add_argument('dataset',
+                                     metavar='zpool/dataset',
+                                     help='Dataset name for which to generate key')
+    generate_key_parser.add_argument('--dir', default='/dev/shm',
+                                     metavar='directory',
+                                     help='Directory in which to create the '
+                                         + 'temporary key file')
+    generate_key_parser.set_defaults(func=generate_key)
+
+    enable_unit_parser = subparsers.add_parser(
+        'enable-unit',
+        help='Enable the systemd unit that will load the key for a dataset at boot'
+    )
+    enable_unit_parser.add_argument('dataset',
+                                    metavar='zpool/dataset',
+                                    help='Dataset name for which to enable key loader')
+    enable_unit_parser.set_defaults(func=enable_unit)
+
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG)
+
+    try:
+        args.func(args, get_config())
+    except Exception as e:
+        raise SystemExit(
+            '{prog}: {msg}'.format(
+                prog=args.prog,
+                msg=e,
+            )
+        )
+
+
+if __name__ == '__main__':
+    main()
