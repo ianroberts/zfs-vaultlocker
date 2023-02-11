@@ -140,7 +140,7 @@ def _generate_and_save_key(args, client, config):
 
     escaped_dataset = _escape_dataset(dataset)
 
-    fd, path = tempfile.mkstemp(dir=args.directory,
+    fd, path = tempfile.mkstemp(dir=args.dir,
                                 prefix=f'zfs-vaultlocker-{escaped_dataset}-',
                                 suffix='.key',
                                 text=True)
