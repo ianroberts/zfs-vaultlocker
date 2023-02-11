@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 CONF_FILE = '/etc/vaultlocker/vaultlocker.conf'
 
 
-
 def _vault_client(config):
     """Helper wrapper to create Vault Client
 
@@ -138,17 +137,15 @@ def _generate_and_save_key(args, client, config):
     dataset = args.dataset
     key = _generate_key(dataset, client, config)
 
-    escaped_dataset = _escape_dataset(dataset)
-
     fd, path = tempfile.mkstemp(dir=args.dir,
-                                prefix=f'zfs-vaultlocker-{escaped_dataset}-',
+                                prefix='zfs-vaultlocker-',
                                 suffix='.key',
                                 text=True)
 
     with os.fdopen(fd, 'w') as f:
         f.write(key)
 
-    logger.info(f'Generated key for {dataset} written to {path}')
+    logger.info(f'Generated key for {dataset} written to file://{path}')
 
 
 def _decrypt_at_boot(args, client, config):

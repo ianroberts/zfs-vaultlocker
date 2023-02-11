@@ -71,7 +71,7 @@ zfs-vaultlocker generate-key {zpool}/{dataset}
 
 Occasionally you may need to generate and store a random key separately from creating the dataset in question.  The intended use case for this is where you want to create the dataset using `zfs receive` from an existing dataset (on the same or another machine) sent using `zfs send -R`.
 
-Since the encrypt-on-receive logic cannot use `keylocation=prompt`, you can instead run `zfs-vaultlocker generate-key {zpool}/{dataset}` to generate the key and store it in Vault as normal, but instead of using the key immediately to create a dataset this command will write the key to `/dev/shm/zfs-vaultlocker-{zpool}-{dataset}-{randomstring}.key` in hex format.  You can then specify `-o encryption=aes-256-gcm -o keyformat=hex -o keylocation=file:/dev/shm/{file-that-was-just-created}` as options to `zfs receive` to encrypt the dataset as it is received.
+Since the encrypt-on-receive logic cannot use `keylocation=prompt`, you can instead run `zfs-vaultlocker generate-key {zpool}/{dataset}` to generate the key and store it in Vault as normal, but instead of using the key immediately to create a dataset this command will write the key to `/dev/shm/zfs-vaultlocker-{randomstring}.key` in hex format.  You can then specify `-o encryption=aes-256-gcm -o keyformat=hex -o keylocation=file:///dev/shm/{file-that-was-just-created}` as options to `zfs receive` to encrypt the dataset as it is received.
 
 Once received, delete the temporary key file and run
 
