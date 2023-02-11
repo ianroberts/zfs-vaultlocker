@@ -98,7 +98,8 @@ def _create_dataset(args, client, config):
     :param: client: hvac.Client for Vault access
     :param: config: configparser object of vaultlocker config
     """
-    key = _generate_key(args.dataset, client, config)
+    dataset = args.dataset
+    key = _generate_key(dataset, client, config)
 
     command_args = [
         'create',
@@ -134,7 +135,8 @@ def _generate_and_save_key(args, client, config):
     :param: client: hvac.Client for Vault access
     :param: config: configparser object of vaultlocker config
     """
-    key = _generate_key(args.dataset, client, config)
+    dataset = args.dataset
+    key = _generate_key(dataset, client, config)
 
     escaped_dataset = _escape_dataset(dataset)
 
