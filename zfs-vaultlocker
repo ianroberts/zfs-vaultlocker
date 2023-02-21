@@ -178,6 +178,20 @@ def _decrypt_dataset(args, client, config):
     """
     dataset = args.dataset
 
+    check_command = [
+        '/sbin/zfs',
+        'get',
+        '-H',
+        '-o',
+        'value',
+        'keystatus',
+        dataset,
+    ]
+    key_available = subprocess.check_output(check_command).strip()
+    if key_available == b'available':
+        logger.info(f'Key already loaded for dataset {dataset}')
+        return
+
     vault_path = _get_vault_path(dataset, config)
     stored_data = client.read(vault_path)
     if stored_data is None:
