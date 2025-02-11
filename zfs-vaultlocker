@@ -117,9 +117,9 @@ def _create_dataset(args, client, config):
     logger.info(f'Creating dataset {dataset}')
 
     create_cmd = pexpect.spawn('/sbin/zfs', command_args)
-    create_cmd.expect('Enter hex key: ')
+    create_cmd.expect('Enter(?: new)? hex key: ?')
     create_cmd.sendline(key)
-    create_cmd.expect('Re-enter hex key: ')
+    create_cmd.expect('Re-enter(?: new)? hex key: ?')
     create_cmd.sendline(key)
     create_cmd.expect(pexpect.EOF)
 
